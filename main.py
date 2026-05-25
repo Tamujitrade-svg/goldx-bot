@@ -1,10 +1,11 @@
 """
-GoldX Pro Bot — Main Orchestration Engine
-==========================================
+GoldX Pro — Macro Trading AI + Decision Assistant
+==================================================
 
 Architecture:
   Data Layer     → price_feed, news_feed, calendar_feed, twitter_feed
   Analysis Layer → technical, fundamental, geopolitical, news analyzers
+  Assistant Layer→ mtf_analyzer, market_structure, trade_checklist, trade_assistant
   Decision Layer → scoring_engine, decision_engine
   Output Layer   → telegram_bot, mt5_executor
 
@@ -17,7 +18,6 @@ Run modes:
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from datetime import datetime
 from typing import Optional
@@ -39,6 +39,12 @@ from core.technical_analyzer import TechnicalAnalyzer
 from core.fundamental_analyzer import FundamentalAnalyzer
 from core.geopolitical_analyzer import GeopoliticalAnalyzer
 from core.news_analyzer import NewsAnalyzer
+
+# ── Assistant Engines ─────────────────────────────────────────────────────────
+from core.mtf_analyzer import MTFAnalyzer
+from core.market_structure import MarketStructureAnalyzer
+from core.trade_checklist import TradeChecklist
+from core.trade_assistant import TradeAssistant
 
 # ── Decision ──────────────────────────────────────────────────────────────────
 from core.scoring_engine import ScoringEngine, GlobalScore
@@ -72,6 +78,12 @@ class GoldXBot:
         self.fundamental = FundamentalAnalyzer()
         self.geopolitical = GeopoliticalAnalyzer()
         self.news_analyzer = NewsAnalyzer()
+
+        # ── Assistant Layer ──────────────────────────────────────────────
+        self.mtf = MTFAnalyzer()
+        self.market_structure_analyzer = MarketStructureAnalyzer()
+        self.checklist = TradeChecklist()
+        self.assistant = TradeAssistant()
 
         # ── Decision ────────────────────────────────────────────────────
         self.scoring = ScoringEngine()
@@ -329,6 +341,300 @@ class GoldXBot:
         except Exception as exc:
             return f"❌ Erreur briefing: {exc}"
 
+    # ── Assistant Public Methods ──────────────────────────────────────────
+
+    def _get_full_context(self, timeframe: str = "M15", bars: int = 300):
+        """Fetch and analyze all data sources. Returns (df, price, tech, fund, geo, news, score)."""
+        df = self.price_feed.get_ohlcv(symbol=SYMBOL, timeframe=timeframe, bars=bars)
+        price = self.price_feed.get_current_price(SYMBOL) or float(df["close"].iloc[-1])
+        articles = self.news_feed.fetch_all(hours_back=6) or self.news_feed.mock_articles()
+        tweets = self.twitter_feed.fetch_all_monitored()
+        tech = self.technical.analyze(df)
+        fund = self.fundamental.analyze()
+        geo = self.geopolitical.analyze(articles)
+        news = self.news_analyzer.analyze(articles, tweets)
+        score = self.scoring.compute(tech, fund, geo, news)
+        return df, price, tech, fund, geo, news, score
+
+    def get_setup_analysis(self) -> str:
+        """Complete setup evaluation: MTF + structure + checklist + grade + plan."""
+        try:
+            df, price, tech, fund, geo, news, score = self._get_full_context()
+            account = self.price_feed.get_account_info()
+
+            # Run all assistant modules
+            mtf = self.mtf.analyze(symbol=SYMBOL)
+            ms = self.market_structure_analyzer.analyze(df, current_price=price)
+            is_blackout, _ = self.calendar_feed.is_news_blackout()
+            decision = self.decision.decide(score, price, account["balance"], is_blackout)
+            direction = score.direction if score.direction != "NEUTRAL" else "BUY"
+
+            checklist = self.checklist.evaluate(
+                direction=direction,
+                mtf_result=mtf,
+                tech_result=tech,
+                fund_result=fund,
+                news_result=news,
+                calendar_feed=self.calendar_feed,
+                rr_ratio=decision.risk_reward,
+                current_price=price,
+            )
+
+            setup = self.assistant.evaluate_setup(
+                direction=direction,
+                current_price=price,
+                score=score,
+                mtf=mtf,
+                checklist=checklist,
+                market_structure=ms,
+                tech=tech,
+                fund=fund,
+                news=news,
+                account_balance=account["balance"],
+            )
+
+            return setup.format_card()
+        except Exception as exc:
+            logger.exception("get_setup_analysis error: {}", exc)
+            return f"❌ Erreur analyse setup: {exc}"
+
+    def get_trade_checklist(self) -> str:
+        """10-point pre-trade checklist for current market conditions."""
+        try:
+            df, price, tech, fund, geo, news, score = self._get_full_context()
+            account = self.price_feed.get_account_info()
+            is_blackout, _ = self.calendar_feed.is_news_blackout()
+            decision = self.decision.decide(score, price, account["balance"], is_blackout)
+            direction = score.direction if score.direction != "NEUTRAL" else "BUY"
+            mtf = self.mtf.analyze(symbol=SYMBOL)
+
+            result = self.checklist.evaluate(
+                direction=direction,
+                mtf_result=mtf,
+                tech_result=tech,
+                fund_result=fund,
+                news_result=news,
+                calendar_feed=self.calendar_feed,
+                rr_ratio=decision.risk_reward,
+                current_price=price,
+            )
+            return result.format_checklist()
+        except Exception as exc:
+            logger.exception("get_trade_checklist error: {}", exc)
+            return f"❌ Erreur checklist: {exc}"
+
+    def get_mtf_analysis(self) -> str:
+        """Multi-timeframe confluence analysis D1 → M5."""
+        try:
+            result = self.mtf.analyze(symbol=SYMBOL)
+            lines = [
+                "📐 **ANALYSE MULTI-TIMEFRAME**",
+                f"Symbole: {SYMBOL}",
+                "",
+                f"🎯 Direction dominante : **{result.dominant_direction}**",
+                f"📊 Confluence          : **{result.confluence_score:.0f}/100**",
+                f"🏅 Grade               : **{result.grade}**",
+                f"🔗 TF alignés          : **{result.aligned_count}/{len(result.timeframes)}**",
+                f"📡 HTF bias (D1+H4)    : **{result.htf_bias}**",
+                f"⚡ Signal LTF (M15+M5) : **{result.ltf_signal}**",
+                f"🕐 Entrée recommandée  : **{result.entry_tf}**",
+                "",
+                "─────────────────────────────",
+            ]
+            lines += result.summary_lines()
+            if result.key_levels:
+                lines += [
+                    "",
+                    "📍 **NIVEAUX IDENTIFIÉS**",
+                    *[f"  `{lvl:.2f}`" for lvl in result.key_levels],
+                ]
+            lines += ["", f"💡 _{result.narrative}_"]
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.exception("get_mtf_analysis error: {}", exc)
+            return f"❌ Erreur MTF: {exc}"
+
+    def get_market_structure(self) -> str:
+        """Market structure analysis (SMC/ICT concepts)."""
+        try:
+            df = self.price_feed.get_ohlcv(symbol=SYMBOL, timeframe="H1", bars=200)
+            price = self.price_feed.get_current_price(SYMBOL) or float(df["close"].iloc[-1])
+            ms = self.market_structure_analyzer.analyze(df, current_price=price)
+            return ms.format_summary()
+        except Exception as exc:
+            logger.exception("get_market_structure error: {}", exc)
+            return f"❌ Erreur structure: {exc}"
+
+    def get_key_levels(self) -> str:
+        """Key support/resistance levels from multiple timeframes."""
+        try:
+            mtf = self.mtf.analyze(symbol=SYMBOL)
+            df_h1 = self.price_feed.get_ohlcv(symbol=SYMBOL, timeframe="H1", bars=200)
+            price = self.price_feed.get_current_price(SYMBOL) or float(df_h1["close"].iloc[-1])
+            ms = self.market_structure_analyzer.analyze(df_h1, current_price=price)
+
+            lines = [
+                f"📍 **NIVEAUX CLÉS — {SYMBOL}**",
+                f"Prix actuel : `{price:.2f}`",
+                "",
+                "🔴 **RÉSISTANCES**",
+            ]
+            # Collect all resistance levels above price
+            resistances = sorted(set(
+                [ms.nearest_resistance, ms.premium_zone]
+                + [lvl for lvl in mtf.key_levels if lvl > price]
+            ))
+            for r in resistances[:4]:
+                dist = r - price
+                pct = dist / price * 100
+                lines.append(f"  `{r:.2f}` (+{dist:.1f} pts / +{pct:.2f}%)")
+
+            lines += ["", "🟢 **SUPPORTS**"]
+            supports = sorted(set(
+                [ms.nearest_support, ms.discount_zone]
+                + [lvl for lvl in mtf.key_levels if lvl < price]
+            ), reverse=True)
+            for s in supports[:4]:
+                dist = price - s
+                pct = dist / price * 100
+                lines.append(f"  `{s:.2f}` (-{dist:.1f} pts / -{pct:.2f}%)")
+
+            lines += [
+                "",
+                f"⚖️ Équilibre (50%): `{ms.equilibrium:.2f}`",
+                f"🔼 Premium (79%): `{ms.premium_zone:.2f}`",
+                f"🔽 Discount (21%): `{ms.discount_zone:.2f}`",
+                "",
+                f"💡 _{ms.narrative}_",
+            ]
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.exception("get_key_levels error: {}", exc)
+            return f"❌ Erreur niveaux: {exc}"
+
+    def validate_trade_idea(self, direction: str) -> str:
+        """Validate a specific trade direction proposed by the user."""
+        try:
+            df, price, tech, fund, geo, news, score = self._get_full_context()
+            account = self.price_feed.get_account_info()
+            mtf = self.mtf.analyze(symbol=SYMBOL)
+            ms = self.market_structure_analyzer.analyze(df, current_price=price)
+            is_blackout, _ = self.calendar_feed.is_news_blackout()
+            decision = self.decision.decide(score, price, account["balance"], is_blackout)
+
+            checklist = self.checklist.evaluate(
+                direction=direction,
+                mtf_result=mtf,
+                tech_result=tech,
+                fund_result=fund,
+                news_result=news,
+                calendar_feed=self.calendar_feed,
+                rr_ratio=decision.risk_reward,
+                current_price=price,
+            )
+            setup = self.assistant.evaluate_setup(
+                direction=direction,
+                current_price=price,
+                score=score,
+                mtf=mtf,
+                checklist=checklist,
+                market_structure=ms,
+                tech=tech,
+                fund=fund,
+                news=news,
+                account_balance=account["balance"],
+            )
+
+            # Add validation context header
+            dir_icon = "📈" if direction == "BUY" else "📉"
+            market_says = score.direction
+            agree = market_says == direction
+            agree_str = "✅ Le marché CONFIRME" if agree else f"⚠️ Le marché PRÉFÈRE {market_says}"
+
+            header = (
+                f"🔍 **VALIDATION {dir_icon} {direction}**\n\n"
+                f"Score bot : {score.global_score:.0f}/100 ({market_says})\n"
+                f"{agree_str} ton idée\n"
+                f"Checklist : {checklist.total_score:.0f}/10 ({checklist.grade})\n\n"
+            )
+            return header + checklist.format_checklist() + "\n\n" + setup.format_card()
+        except Exception as exc:
+            logger.exception("validate_trade_idea error: {}", exc)
+            return f"❌ Erreur validation: {exc}"
+
+    def ask_assistant(self, question: str) -> str:
+        """Answer a natural language question about the current market."""
+        try:
+            _, price, tech, fund, _, news, score = self._get_full_context()
+            df_h1 = self.price_feed.get_ohlcv(symbol=SYMBOL, timeframe="H1", bars=100)
+            ms = self.market_structure_analyzer.analyze(df_h1, current_price=price)
+            return self.assistant.ask(
+                question=question,
+                score=score,
+                market_structure=ms,
+                tech=tech,
+                fund=fund,
+                news=news,
+            )
+        except Exception as exc:
+            logger.exception("ask_assistant error: {}", exc)
+            return f"❌ Erreur assistant: {exc}"
+
+    def get_management_guidance(self) -> str:
+        """Trade management guidance based on open positions and current structure."""
+        try:
+            positions = self.executor.get_open_positions()
+            price = self.price_feed.get_current_price(SYMBOL) or 0.0
+            df_h1 = self.price_feed.get_ohlcv(symbol=SYMBOL, timeframe="H1", bars=100)
+            ms = self.market_structure_analyzer.analyze(df_h1, current_price=price)
+
+            if not positions:
+                return (
+                    f"📋 **GESTION DE POSITIONS**\n\n"
+                    f"Aucune position ouverte sur {SYMBOL}.\n\n"
+                    f"Prix actuel : `{price:.2f}`\n"
+                    f"Structure   : {ms.trend}\n"
+                    f"Support     : `{ms.nearest_support:.2f}`\n"
+                    f"Résistance  : `{ms.nearest_resistance:.2f}`\n\n"
+                    f"💡 _{ms.narrative}_"
+                )
+
+            lines = [f"📋 **GESTION DE POSITIONS ({len(positions)} ouverte(s))**", ""]
+            for pos in positions:
+                pl_icon = "💚" if pos.profit >= 0 else "🔴"
+                direction_from_sl = "BUY" if pos.order_type == "BUY" else "SELL"
+                pips_profit = abs(pos.current_price - pos.entry_price) / 0.1
+
+                # Management recommendation
+                if pos.profit > 0:
+                    if direction_from_sl == "BUY" and pos.current_price > ms.nearest_resistance:
+                        advice = "🎯 Proche résistance — envisager prise de profit partielle"
+                    elif direction_from_sl == "BUY":
+                        advice = "✅ Position en profit — déplacer SL au breakeven"
+                    else:
+                        advice = "✅ Position en profit — protéger les gains"
+                else:
+                    advice = "⚠️ Position en perte — respecter le SL initial"
+
+                lines += [
+                    f"{'─' * 30}",
+                    f"{pl_icon} **{pos.order_type}** @ `{pos.entry_price:.2f}`",
+                    f"  Prix actuel   : `{pos.current_price:.2f}`",
+                    f"  P&L           : `{pos.profit:+.2f}$` ({pips_profit:.0f} pips)",
+                    f"  SL / TP       : `{pos.stop_loss:.2f}` / `{pos.take_profit:.2f}`",
+                    f"  Lots          : `{pos.volume:.2f}`",
+                    f"  💡 {advice}",
+                ]
+            lines += [
+                "",
+                f"📍 Marché actuel : `{price:.2f}` | {ms.trend}",
+                f"🛡 Support : `{ms.nearest_support:.2f}` | 🎯 Résistance : `{ms.nearest_resistance:.2f}`",
+            ]
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.exception("get_management_guidance error: {}", exc)
+            return f"❌ Erreur gestion: {exc}"
+
     # ── Internal Scheduled Jobs ───────────────────────────────────────────
 
     def _send_daily_briefing(self) -> None:
@@ -346,34 +652,71 @@ class GoldXBot:
     # ── Demo Mode ─────────────────────────────────────────────────────────
 
     def _run_demo(self) -> None:
-        logger.info("=== DEMO MODE ===")
-        print("\n" + "=" * 60)
-        print("  GOLDX PRO BOT — DEMO ANALYSIS")
-        print("=" * 60 + "\n")
+        logger.info("=== DEMO MODE — ASSISTANT ===")
+        print("\n" + "=" * 65)
+        print("  GOLDX PRO — ASSISTANT DE TRADING (DEMO)")
+        print("=" * 65 + "\n")
 
         df = self.price_feed._mock_ohlcv(300)
         articles = self.news_feed.mock_articles()
         tweets = self.twitter_feed._mock_tweets()
+        current_price = 2374.50
 
         tech = self.technical.analyze(df)
         fund = self.fundamental.analyze()
         geo = self.geopolitical.analyze(articles)
         news = self.news_analyzer.analyze(articles, tweets)
         score = self.scoring.compute(tech, fund, geo, news)
-
-        current_price = 2374.50
         decision = self.decision.decide(score, current_price, account_balance=10000.0)
 
+        # ── 1. Signal ─────────────────────────────────────────────────
+        print("━━━ 1. SIGNAL 4 PILIERS ━━━")
         signal_msg = alerts.format_signal(
             decision, score, current_price,
-            llm_summary="Les déclarations de Trump sur les tarifs et la faiblesse du CPI sont haussières pour l'or.",
-            geo_summary="Tensions au Moyen-Orient persistantes — prime de risque géopolitique élevée.",
+            llm_summary="Trump tariffs + CPI faible = haussier or. FED dovish attendu.",
+            geo_summary="Moyen-Orient: tensions persistantes — prime de risque élevée.",
         )
-
         print(signal_msg)
-        print("\n" + "=" * 60)
-        print(decision.summary())
-        print("=" * 60 + "\n")
+
+        # ── 2. MTF ────────────────────────────────────────────────────
+        print("\n━━━ 2. MULTI-TIMEFRAME ━━━")
+        mtf = self.mtf.analyze(symbol=SYMBOL)
+        print(f"Direction: {mtf.dominant_direction} | Grade: {mtf.grade} | "
+              f"Confluence: {mtf.confluence_score:.0f}% | Alignés: {mtf.aligned_count}/5")
+        for line in mtf.summary_lines():
+            print(line)
+        print(f"\n💡 {mtf.narrative}")
+
+        # ── 3. Market Structure ───────────────────────────────────────
+        print("\n━━━ 3. STRUCTURE DE MARCHÉ ━━━")
+        ms = self.market_structure_analyzer.analyze(df, current_price=current_price)
+        print(ms.format_summary())
+
+        # ── 4. Checklist ──────────────────────────────────────────────
+        print("\n━━━ 4. CHECKLIST PRÉ-TRADE ━━━")
+        checklist = self.checklist.evaluate(
+            direction=score.direction or "BUY",
+            mtf_result=mtf,
+            tech_result=tech,
+            fund_result=fund,
+            news_result=news,
+            calendar_feed=self.calendar_feed,
+            rr_ratio=decision.risk_reward,
+            current_price=current_price,
+        )
+        print(checklist.format_checklist())
+
+        # ── 5. Setup Card ─────────────────────────────────────────────
+        print("\n━━━ 5. FICHE SETUP COMPLÈTE ━━━")
+        setup = self.assistant.evaluate_setup(
+            direction=score.direction or "BUY",
+            current_price=current_price,
+            score=score, mtf=mtf, checklist=checklist,
+            market_structure=ms, tech=tech, fund=fund, news=news,
+            account_balance=10000.0,
+        )
+        print(setup.format_card())
+        print("=" * 65 + "\n")
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
